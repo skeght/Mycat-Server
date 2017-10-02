@@ -23,10 +23,32 @@
  */
 package io.mycat.server;
 
+import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import io.mycat.MycatServer;
 import io.mycat.backend.BackendConnection;
 import io.mycat.backend.datasource.PhysicalDBNode;
-import io.mycat.backend.mysql.nio.handler.*;
+import io.mycat.backend.mysql.nio.handler.CommitNodeHandler;
+import io.mycat.backend.mysql.nio.handler.KillConnectionHandler;
+import io.mycat.backend.mysql.nio.handler.LockTablesHandler;
+import io.mycat.backend.mysql.nio.handler.MiddlerResultHandler;
+import io.mycat.backend.mysql.nio.handler.MultiNodeCoordinator;
+import io.mycat.backend.mysql.nio.handler.MultiNodeQueryHandler;
+import io.mycat.backend.mysql.nio.handler.RollbackNodeHandler;
+import io.mycat.backend.mysql.nio.handler.RollbackReleaseHandler;
+import io.mycat.backend.mysql.nio.handler.SingleNodeHandler;
+import io.mycat.backend.mysql.nio.handler.UnLockTablesHandler;
 import io.mycat.config.ErrorCode;
 import io.mycat.config.MycatConfig;
 import io.mycat.net.FrontendConnection;
@@ -35,17 +57,6 @@ import io.mycat.route.RouteResultset;
 import io.mycat.route.RouteResultsetNode;
 import io.mycat.server.parser.ServerParse;
 import io.mycat.server.sqlcmd.SQLCmdConstant;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author mycat
@@ -56,8 +67,8 @@ public class NonBlockingSession implements Session {
     public static final Logger LOGGER = LoggerFactory.getLogger(NonBlockingSession.class);
 
     private final ServerConnection source;
-    private final ConcurrentHashMap<RouteResultsetNode, BackendConnection> target;
-
+    //huangyiming add 避免出现jdk版本冲突
+    private final ConcurrentMap<RouteResultsetNode, BackendConnection> target;
     // life-cycle: each sql execution
     private volatile SingleNodeHandler singleNodeHandler;
     private volatile MultiNodeQueryHandler multiNodeHandler;
@@ -66,6 +77,10 @@ public class NonBlockingSession implements Session {
     private final CommitNodeHandler commitHandler;
     private volatile String xaTXID;
 
+   //huangyiming 
+  	private  volatile boolean canClose = true;
+  	
+  	private volatile MiddlerResultHandler  middlerResultHandler;
     private boolean prepared;
 
     public NonBlockingSession(ServerConnection source) {
@@ -100,7 +115,7 @@ public class NonBlockingSession implements Session {
     public BackendConnection removeTarget(RouteResultsetNode key) {
         return target.remove(key);
     }
-
+    
     @Override
     public void execute(RouteResultset rrs, int type) {
 
@@ -149,7 +164,6 @@ public class NonBlockingSession implements Session {
                 } else {
                     multiNodeHandler.execute();
                 }
-
             } catch (Exception e) {
                 LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
                 source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
@@ -192,7 +206,6 @@ public class NonBlockingSession implements Session {
         if(!isALLGlobal()){
             switch(MycatServer.getInstance().getConfig().getSystem().getHandleDistributedTransactions()) {
                 case 1:
-//                        rollback();
                     source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND, "Distributed transaction is disabled!Please rollback!");
                     source.setTxInterrupt("Distributed transaction is disabled!");
                     break;
@@ -202,6 +215,7 @@ public class NonBlockingSession implements Session {
                     break;
                 default:
                     multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
+
             }
         } else {
             multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
@@ -214,11 +228,19 @@ public class NonBlockingSession implements Session {
             ByteBuffer buffer = source.allocate();
             buffer = source.writeToBuffer(OkPacket.OK, buffer);
             source.write(buffer);
+            /* 1. 如果开启了 xa 事务 */
+            if(getXaTXID()!=null){
+				setXATXEnabled(false);
+			}
+            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+            if(source.isPreAcStates()&&!source.isAutocommit()){
+            	source.setAutocommit(true);
+            }
             return;
         } else if (initCount == 1) {
-            BackendConnection con = target.elements().nextElement();
+        	//huangyiming add 避免出现jdk版本冲突
+            BackendConnection con = target.values().iterator().next();
             commitHandler.commit(con);
-
         } else {
 
             if (LOGGER.isDebugEnabled()) {
@@ -250,6 +272,14 @@ public class NonBlockingSession implements Session {
             ByteBuffer buffer = source.allocate();
             buffer = source.writeToBuffer(OkPacket.OK, buffer);
             source.write(buffer);
+            /* 1. 如果开启了 xa 事务 */
+            if(getXaTXID()!=null){
+				setXATXEnabled(false);
+			}
+            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+            if(source.isPreAcStates()&&!source.isAutocommit()){
+            	source.setAutocommit(true);
+            }
             return;
         }
 
@@ -257,6 +287,43 @@ public class NonBlockingSession implements Session {
         rollbackHandler.rollback();
     }
 
+	/**
+	 * 执行lock tables语句方法
+	 * @author songdabin
+	 * @date 2016-7-9
+	 * @param rrs
+	 */
+	public void lockTable(RouteResultset rrs) {
+		// 检查路由结果是否为空
+		RouteResultsetNode[] nodes = rrs.getNodes();
+		if (nodes == null || nodes.length == 0 || nodes[0].getName() == null
+				|| nodes[0].getName().equals("")) {
+			source.writeErrMessage(ErrorCode.ER_NO_DB_ERROR,
+					"No dataNode found ,please check tables defined in schema:"
+							+ source.getSchema());
+			return;
+		}
+		LockTablesHandler handler = new LockTablesHandler(this, rrs);
+		source.setLocked(true);
+		try {
+			handler.execute();
+		} catch (Exception e) {
+			LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
+			source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
+		}
+	}
+
+	/**
+	 * 执行unlock tables语句方法
+	 * @author songdabin
+	 * @date 2016-7-9
+	 * @param rrs
+	 */
+	public void unLockTable(String sql) {
+		UnLockTablesHandler handler = new UnLockTablesHandler(this, this.source.isAutocommit(), sql);
+		handler.execute();
+	}
+	
     @Override
     public void cancel(FrontendConnection sponsor) {
 
@@ -289,8 +356,8 @@ public class NonBlockingSession implements Session {
             if (node.isDisctTable()) {
                 return;
             }
-            if (this.source.isAutocommit() || conn.isFromSlaveDB()
-                    || !conn.isModifiedSQLExecuted()) {
+            if ((this.source.isAutocommit() || conn.isFromSlaveDB()
+                    || !conn.isModifiedSQLExecuted()) && !this.source.isLocked()) {
                 releaseConnection((RouteResultsetNode) conn.getAttachment(), LOGGER.isDebugEnabled(), needRollback);
             }
         }
@@ -311,20 +378,21 @@ public class NonBlockingSession implements Session {
                 if (c.isAutocommit()) {
                     c.release();
                 } else
-                //  if (needRollback)
+                //if (needRollback)
                 {
                     c.setResponseHandler(new RollbackReleaseHandler());
                     c.rollback();
                 }
-                //              else {
-//					c.release();
-//				}
+                //else {
+				//	c.release();
+				//}
             }
         }
     }
 
     public void releaseConnections(final boolean needRollback) {
         boolean debug = LOGGER.isDebugEnabled();
+        
         for (RouteResultsetNode rrn : target.keySet()) {
             releaseConnection(rrn, debug, needRollback);
         }
@@ -356,7 +424,7 @@ public class NonBlockingSession implements Session {
         // " to key "+key.getName()+" on sesion "+this);
         return target.put(key, conn);
     }
-
+    
     public boolean tryExistsCon(final BackendConnection conn, RouteResultsetNode node) {
         if (conn == null) {
             return false;
@@ -480,15 +548,19 @@ public class NonBlockingSession implements Session {
     }
 
     private String genXATXID() {
-        return MycatServer.getInstance().genXATXID();
+        return MycatServer.getInstance().getXATXIDGLOBAL();
     }
 
     public void setXATXEnabled(boolean xaTXEnabled) {
 
-        LOGGER.info("XA Transaction enabled ,con " + this.getSource());
-        if (xaTXEnabled && this.xaTXID == null) {
-            xaTXID = genXATXID();
-
+        if (xaTXEnabled) {
+        	LOGGER.info("XA Transaction enabled ,con " + this.getSource());
+        	if(this.xaTXID == null){
+        		xaTXID = genXATXID();
+        	}
+        }else{
+        	LOGGER.info("XA Transaction disabled ,con " + this.getSource());
+        	this.xaTXID = null;
         }
     }
 
@@ -504,4 +576,22 @@ public class NonBlockingSession implements Session {
         this.prepared = prepared;
     }
 
+
+	public boolean isCanClose() {
+		return canClose;
+	}
+
+	public void setCanClose(boolean canClose) {
+		this.canClose = canClose;
+	}
+
+	public MiddlerResultHandler getMiddlerResultHandler() {
+		return middlerResultHandler;
+	}
+
+	public void setMiddlerResultHandler(MiddlerResultHandler middlerResultHandler) {
+		this.middlerResultHandler = middlerResultHandler;
+	}
+
+    
 }

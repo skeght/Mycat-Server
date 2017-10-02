@@ -59,6 +59,7 @@ public class BinaryRowDataPacket extends MySQLPacket {
 		this.fieldPackets = fieldPackets;
 		this.fieldCount = unsafeRow.numFields();
 		this.fieldValues = new ArrayList<byte[]>(fieldCount);
+		this.packetId = unsafeRow.packetId;
 		this.nullBitMap = new byte[(fieldCount + 7 + 2) / 8];
 		
 		for(int i = 0; i < this.fieldCount; i++) {
@@ -82,6 +83,7 @@ public class BinaryRowDataPacket extends MySQLPacket {
 		this.fieldPackets = fieldPackets;
 		this.fieldCount = rowDataPk.fieldCount;
 		this.fieldValues = new ArrayList<byte[]>(fieldCount);
+		this.packetId = rowDataPk.packetId;
 		this.nullBitMap = new byte[(fieldCount + 7 + 2) / 8];
 		
 		List<byte[]> _fieldValues = rowDataPk.fieldValues;
@@ -192,10 +194,11 @@ public class BinaryRowDataPacket extends MySQLPacket {
 			break;
 		case Fields.FIELD_TYPE_DATE:
 			try {
-				Date dateVar = DateUtil.parseDate(
-						ByteUtil.getDate(fv),
-						DateUtil.DATE_PATTERN_ONLY_DATE);
-				this.fieldValues.add(ByteUtil.getBytes(dateVar, false));
+				Date dateVar = DateUtil.parseDate(ByteUtil.getDate(fv), DateUtil.DATE_PATTERN_ONLY_DATE);
+				this.fieldValues.add(ByteUtil.getBytes(dateVar, false));				
+			} catch(org.joda.time.IllegalFieldValueException e1) {
+				// 当时间为 0000-00-00 00:00:00 的时候, 默认返回 1970-01-01 08:00:00.0
+				this.fieldValues.add(ByteUtil.getBytes(new Date(0L), false));
 			} catch (ParseException e) {
 				LOGGER.error("error",e);
 			}
@@ -206,16 +209,16 @@ public class BinaryRowDataPacket extends MySQLPacket {
 			Date dateTimeVar = null;
 			try {
 				if (dateStr.indexOf(".") > 0) {
-					dateTimeVar = DateUtil.parseDate(dateStr,
-							DateUtil.DATE_PATTERN_FULL);
-					this.fieldValues.add(ByteUtil.getBytes(dateTimeVar,
-							false));
+					dateTimeVar = DateUtil.parseDate(dateStr, DateUtil.DATE_PATTERN_FULL);
+					this.fieldValues.add(ByteUtil.getBytes(dateTimeVar, false));
 				} else {
-					dateTimeVar = DateUtil.parseDate(dateStr,
-							DateUtil.DEFAULT_DATE_PATTERN);
-					this.fieldValues.add(ByteUtil.getBytes(dateTimeVar,
-							false));
+					dateTimeVar = DateUtil.parseDate(dateStr, DateUtil.DEFAULT_DATE_PATTERN);
+					this.fieldValues.add(ByteUtil.getBytes(dateTimeVar, false));
 				}
+			} catch(org.joda.time.IllegalFieldValueException e1) {
+				// 当时间为 0000-00-00 00:00:00 的时候, 默认返回 1970-01-01 08:00:00.0
+				this.fieldValues.add(ByteUtil.getBytes(new Date(0L), false));
+				
 			} catch (ParseException e) {
 				LOGGER.error("error",e);
 			}
@@ -225,16 +228,17 @@ public class BinaryRowDataPacket extends MySQLPacket {
 			Date timeVar = null;
 			try {
 				if (timeStr.indexOf(".") > 0) {
-					timeVar = DateUtil.parseDate(timeStr,
-							DateUtil.TIME_PATTERN_FULL);
-					this.fieldValues.add(ByteUtil.getBytes(timeVar,
-							true));
+					timeVar = DateUtil.parseDate(timeStr, DateUtil.TIME_PATTERN_FULL);
+					this.fieldValues.add(ByteUtil.getBytes(timeVar, true));
 				} else {
-					timeVar = DateUtil.parseDate(timeStr,
-							DateUtil.DEFAULT_TIME_PATTERN);
-					this.fieldValues.add(ByteUtil.getBytes(timeVar,
-							true));
+					timeVar = DateUtil.parseDate(timeStr, DateUtil.DEFAULT_TIME_PATTERN);
+					this.fieldValues.add(ByteUtil.getBytes(timeVar, true));
 				}
+				
+			} catch(org.joda.time.IllegalFieldValueException e1) {
+				// 当时间为 0000-00-00 00:00:00 的时候, 默认返回 1970-01-01 08:00:00.0
+				this.fieldValues.add(ByteUtil.getBytes(new Date(0L), true));
+				
 			} catch (ParseException e) {
 				LOGGER.error("error",e);
 			}
@@ -357,9 +361,21 @@ public class BinaryRowDataPacket extends MySQLPacket {
 				case Fields.FIELD_TYPE_BIT:
 				case Fields.FIELD_TYPE_DECIMAL:
 				case Fields.FIELD_TYPE_NEW_DECIMAL:
-					// 长度编码的字符串需要一个字节来存储长度
+					/*
+					 * 长度编码的字符串需要计算存储长度, 根据mysql协议文档描述
+					 * To convert a length-encoded integer into its numeric value, check the first byte:
+					 * If it is < 0xfb, treat it as a 1-byte integer.
+                     * If it is 0xfc, it is followed by a 2-byte integer.
+                     * If it is 0xfd, it is followed by a 3-byte integer.
+                     * If it is 0xfe, it is followed by a 8-byte integer.
+					 * 
+					 */
 					if(value.length != 0) {
-						size = size + 1 + value.length;
+						/*
+						 * 长度编码的字符串需要计算存储长度,不能简单默认只有1个字节是表示长度,当数据足够长,占用的就不止1个字节
+						 */
+//						size = size + 1 + value.length;
+						size = size + BufferUtil.getLength(value);
 					} else {
 						size = size + 1; // 处理空字符串,只计算长度1个字节
 					}

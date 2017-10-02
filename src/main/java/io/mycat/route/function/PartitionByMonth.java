@@ -127,9 +127,15 @@ public class PartitionByMonth extends AbstractPartitionAlgorithm implements
 			int size = list.size();
 			return (list.toArray(new Integer[size]));
 		} catch (ParseException e) {
-			LOGGER.error(e);
+			LOGGER.error("error",e);
 			return new Integer[0];
 		}
+	}
+	
+	@Override
+	public int getPartitionNum() {
+		int nPartition = this.nPartition;
+		return nPartition;
 	}
 
 	public void setsBeginDate(String sBeginDate) {

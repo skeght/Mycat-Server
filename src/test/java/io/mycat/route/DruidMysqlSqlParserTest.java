@@ -5,6 +5,7 @@ import java.util.Map;
 
 import org.junit.Test;
 
+import io.mycat.MycatServer;
 import io.mycat.SimpleCachePool;
 import io.mycat.cache.LayerCachePool;
 import io.mycat.config.loader.SchemaLoader;
@@ -12,6 +13,7 @@ import io.mycat.config.loader.xml.XMLSchemaLoader;
 import io.mycat.config.model.SchemaConfig;
 import io.mycat.config.model.SystemConfig;
 import io.mycat.route.factory.RouteStrategyFactory;
+import io.mycat.server.parser.ServerParse;
 import junit.framework.Assert;
 
 public class DruidMysqlSqlParserTest
@@ -25,6 +27,7 @@ public class DruidMysqlSqlParserTest
 		String ruleFile = "/route/rule.xml";
 		SchemaLoader schemaLoader = new XMLSchemaLoader(schemaFile, ruleFile);
 		schemaMap = schemaLoader.getSchemas();
+		MycatServer.getInstance().getConfig().getSchemas().putAll(schemaMap);
         RouteStrategyFactory.init();
         routeStrategy = RouteStrategyFactory.getRouteStrategy("druidparser");
 	}
@@ -71,10 +74,15 @@ public class DruidMysqlSqlParserTest
         Assert.assertEquals(0, rrs.getNodes()[0].getLimitStart());
         Assert.assertEquals(10, rrs.getNodes()[0].getLimitSize());
         Assert.assertEquals("dn1", rrs.getNodes()[0].getName());
-
 	}
 
-
+	@Test
+	public void testLockTableSql() throws SQLNonTransientException{
+		String sql = "lock tables goods write";
+		SchemaConfig schema = schemaMap.get("TESTDB");
+		RouteResultset rrs = routeStrategy.route(new SystemConfig(), schema, ServerParse.LOCK, sql, null, null, cachePool);
+		Assert.assertEquals(3, rrs.getNodes().length);
+	}
 
 
 }

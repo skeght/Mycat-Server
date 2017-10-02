@@ -26,8 +26,10 @@ package io.mycat.config;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
-import org.slf4j.Logger; 
+import io.mycat.config.loader.xml.XMLServerLoader;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.alibaba.druid.sql.ast.SQLStatement;
@@ -102,17 +104,20 @@ public class MycatPrivileges implements FrontendPrivileges {
     @Override
     public Set<String> getUserSchemas(String user) {
         MycatConfig conf = MycatServer.getInstance().getConfig();
+        
         UserConfig uc = conf.getUsers().get(user);
         if (uc != null) {
             return uc.getSchemas();
         } else {
             return null;
         }
-    }
+    
+     }
     
     @Override
     public Boolean isReadOnly(String user) {
         MycatConfig conf = MycatServer.getInstance().getConfig();
+       
         UserConfig uc = conf.getUsers().get(user);
         if (uc != null) {
             return uc.isReadOnly();
@@ -132,6 +137,16 @@ public class MycatPrivileges implements FrontendPrivileges {
         }
 	}
 
+	/**
+	 * 防火墙白名单处理，根据防火墙配置，判断目前主机是否可以通过某用户登陆
+	 * 白名单配置请参考：
+	 * @see  XMLServerLoader
+	 * @see  FirewallConfig
+	 *
+	 * @modification 修改增加网段白名单识别配置
+	 * @date 2016/12/8
+	 * @modifiedBy Hash Zhang
+	 */
 	@Override
 	public boolean checkFirewallWhiteHostPolicy(String user, String host) {
 		
@@ -142,13 +157,23 @@ public class MycatPrivileges implements FrontendPrivileges {
         boolean isPassed = false;
         
         Map<String, List<UserConfig>> whitehost = firewallConfig.getWhitehost();
-        if (whitehost == null || whitehost.size() == 0) {        	
+        Map<Pattern, List<UserConfig>> whitehostMask = firewallConfig.getWhitehostMask();
+        if ((whitehost == null || whitehost.size() == 0)&&(whitehostMask == null || whitehostMask.size() == 0)) {
         	Map<String, UserConfig> users = mycatConfig.getUsers();
         	isPassed = users.containsKey(user);
         	
-        } else {        	
+        } else {
         	List<UserConfig> list = whitehost.get(host);
-			if (list != null) {			
+			Set<Pattern> patterns = whitehostMask.keySet();
+			if(patterns != null && patterns.size() > 0){
+				for(Pattern pattern : patterns) {
+					if(pattern.matcher(host).find()){
+						isPassed = true;
+						break;
+					}
+				}
+			}
+			if (list != null) {
 				for (UserConfig userConfig : list) {
 					if (userConfig.getName().equals(user)) {
 						isPassed = true;
@@ -228,6 +253,14 @@ public class MycatPrivileges implements FrontendPrivileges {
 					int index = -1;
 					
 					//TODO 此处待优化，寻找更优SQL 解析器
+					
+					//修复bug
+					// https://github.com/alibaba/druid/issues/1309
+					//com.alibaba.druid.sql.parser.ParserException: syntax error, error in :'begin',expect END, actual EOF begin
+					if ( sql != null && sql.length() == 5 && sql.equalsIgnoreCase("begin") ) {
+						return true;
+					}
+					
 					SQLStatementParser parser = new MycatStatementParser(sql);			
 					SQLStatement stmt = parser.parseStatement();
 					

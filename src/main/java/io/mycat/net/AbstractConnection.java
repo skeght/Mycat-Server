@@ -24,9 +24,11 @@
 package io.mycat.net;
 
 import java.io.IOException;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousChannel;
 import java.nio.channels.NetworkChannel;
+import java.nio.channels.SocketChannel;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -214,6 +216,10 @@ public abstract class AbstractConnection implements NIOConnection {
 
 	public long getLastWriteTime() {
 		return lastWriteTime;
+	}
+	
+	public void setLastWriteTime(long lasttime){
+		this.lastWriteTime = lasttime;
 	}
 
 	public long getNetInBytes() {
@@ -509,6 +515,10 @@ public abstract class AbstractConnection implements NIOConnection {
 			if (reason.contains("connection,reason:java.net.ConnectException")) {
 				throw new RuntimeException(" errr");
 			}
+		} else {
+		    // make sure cleanup again
+		    // Fix issue#1616
+		    this.cleanup();
 		}
 	}
 
@@ -576,7 +586,17 @@ public abstract class AbstractConnection implements NIOConnection {
 
 	private void closeSocket() {
 		if (channel != null) {
-			
+			if (channel instanceof SocketChannel) {
+				Socket socket = ((SocketChannel) channel).socket();
+				if (socket != null) {
+					try {
+						socket.close();
+					} catch (IOException e) {
+				       LOGGER.error("closeChannelError", e);
+					}
+				}
+			}
+				
 			boolean isSocketClosed = true;
 			try {
 				channel.close();

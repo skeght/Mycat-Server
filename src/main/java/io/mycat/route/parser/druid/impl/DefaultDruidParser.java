@@ -6,9 +6,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.slf4j.Logger; import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.alibaba.druid.sql.ast.SQLStatement;
+import com.alibaba.druid.sql.ast.statement.SQLSelectQuery;
+import com.alibaba.druid.sql.ast.statement.SQLSelectStatement;
+import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlSelectQueryBlock;
 import com.alibaba.druid.sql.visitor.SchemaStatVisitor;
 import com.alibaba.druid.stat.TableStat.Condition;
 
@@ -60,11 +64,19 @@ public class DefaultDruidParser implements DruidParser {
 		ctx.setSql(originSql);
 		//通过visitor解析
 		visitorParse(rrs,stmt,schemaStatVisitor);
+
 		//通过Statement解析
 		statementParse(schema, rrs, stmt);
-		
-		//改写sql：如insert语句主键自增长的可以
-		changeSql(schema, rrs, stmt,cachePool);
+	}
+	
+	/**
+	 * 是否终止解析,子类可覆盖此方法控制解析进程.
+	 * 存在子查询的情况下,如果子查询需要先执行获取返回结果后,进一步改写sql后,再执行 在这种情况下,不再需要statement 和changeSql 解析。增加此模板方法
+	 * @param schemaStatVisitor
+	 * @return
+	 */
+	public boolean afterVisitorParser(RouteResultset rrs, SQLStatement stmt,MycatSchemaStatVisitor schemaStatVisitor){
+		return false;
 	}
 	
 	/**
@@ -94,7 +106,17 @@ public class DefaultDruidParser implements DruidParser {
 	public void visitorParse(RouteResultset rrs, SQLStatement stmt,MycatSchemaStatVisitor visitor) throws SQLNonTransientException{
 
 		stmt.accept(visitor);
-		
+		ctx.setVisitor(visitor);
+
+		if(stmt instanceof SQLSelectStatement){
+			SQLSelectQuery query = ((SQLSelectStatement) stmt).getSelect().getQuery();
+			if(query instanceof MySqlSelectQueryBlock){
+				if(((MySqlSelectQueryBlock)query).isForUpdate()){
+					rrs.setSelectForUpdate(true);
+				}
+			}
+		}
+
 		List<List<Condition>> mergedConditionList = new ArrayList<List<Condition>>();
 		if(visitor.hasOrCondition()) {//包含or语句
 			//TODO
@@ -102,6 +124,11 @@ public class DefaultDruidParser implements DruidParser {
 			mergedConditionList = visitor.splitConditions();
 		} else {//不包含OR语句
 			mergedConditionList.add(visitor.getConditions());
+		}
+		
+		if(visitor.isHasChange()){	// 在解析的过程中子查询被改写了.需要更新ctx.
+			ctx.setSql(stmt.toString());
+			rrs.setStatement(ctx.getSql());
 		}
 		
 		if(visitor.getAliasMap() != null) {
@@ -120,9 +147,7 @@ public class DefaultDruidParser implements DruidParser {
 					if(pos> 0) {
 						key = key.substring(pos + 1);
 					}
-					if(key.equalsIgnoreCase(value)) {
-						ctx.addTable(key.toUpperCase());
-					}
+					
 					tableAliasMap.put(key.toUpperCase(), value);
 				}
 				
@@ -132,6 +157,8 @@ public class DefaultDruidParser implements DruidParser {
 //				}
 
 			}
+			ctx.addTables(visitor.getTables());
+			
 			visitor.getAliasMap().putAll(tableAliasMap);
 			ctx.setTableAliasMap(tableAliasMap);
 		}
@@ -146,7 +173,7 @@ public class DefaultDruidParser implements DruidParser {
 			for(Condition condition : conditionList.get(i)) {
 				List<Object> values = condition.getValues();
 				if(values.size() == 0) {
-					break;
+					continue;  
 				}
 				if(checkConditionValues(values)) {
 					String columnName = StringUtil.removeBackquote(condition.getColumn().getName().toUpperCase());

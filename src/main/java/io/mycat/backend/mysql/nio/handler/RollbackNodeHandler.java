@@ -25,6 +25,7 @@ package io.mycat.backend.mysql.nio.handler;
 
 import java.util.List;
 
+import io.mycat.backend.mysql.nio.MySQLConnection;
 import io.mycat.config.ErrorCode;
 import org.slf4j.Logger; import org.slf4j.LoggerFactory;
 
@@ -81,7 +82,18 @@ public class RollbackNodeHandler extends MultiNodeHandler {
 					return;
 				}
 				conn.setResponseHandler(RollbackNodeHandler.this);
-				conn.rollback();
+
+				//support the XA rollback
+				if(session.getXaTXID()!=null && conn instanceof  MySQLConnection) {
+					MySQLConnection mysqlCon = (MySQLConnection) conn;
+					String xaTxId = session.getXaTXID() +",'"+ mysqlCon.getSchema()+"'";
+					//exeBatch cmd issue : the 2nd package can not receive the response
+					mysqlCon.execCmd("XA END " + xaTxId  + ";");
+					mysqlCon.execCmd("XA ROLLBACK " + xaTxId + ";");
+				}else {
+					conn.rollback();
+				}
+
 
 				++started;
 			}
@@ -104,6 +116,16 @@ public class RollbackNodeHandler extends MultiNodeHandler {
 			if (this.isFail() || session.closed()) {
 				tryErrorFinished(true);
 			} else {
+				/* 1.  事务结束后,xa事务结束    */
+				if(session.getXaTXID()!=null){
+					session.setXATXEnabled(false);
+				}
+				
+				/* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
+		        if(session.getSource().isPreAcStates()&&!session.getSource().isAutocommit()){
+		        	session.getSource().setAutocommit(true);
+		        }
+		        
 				session.getSource().write(ok);
 			}
 		}
